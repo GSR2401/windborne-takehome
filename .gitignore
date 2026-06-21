@@ -1,0 +1,8 @@
+windborne.db
+windborne.db-wal
+windborne.db-shm
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.env
