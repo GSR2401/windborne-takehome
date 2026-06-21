@@ -1,5 +1,62 @@
 # WindBorne Take-Home Demo
 
+## System Design
+
+### Scale assumptions
+- ~10,000 balloons aloft, each transmitting ~once per minute with ±5 min variation
+- Sustained load: ~167 packets/second, 24/7
+- Revenue rule: observation must reach customer within 5 minutes of downlink time
+
+### Production architecture
+
+```text
+Satellite provider FIFO queue
+        |
+        v
+  [Intake poller]  <-- polls provider API in a loop, one packet at a time
+        |
+        | persist raw packet (BEGIN / INSERT / COMMIT)
+        v
+  Durable DB (Postgres / CockroachDB)
+        |
+        | publish packet_id
+        v
+  Durable queue (SQS / Pub-Sub / Kafka)
+        |
+        v
+  [Decoder workers]  <-- stateless, horizontally scalable
+        |
+        v
+  Observations table  -->  Customer API
+```
+
+### Answers to the key design questions
+
+**How do you receive from the satellite provider's FIFO queue?**
+The provider holds packets until we ACK them. In production a poller service calls the provider's dequeue API in a loop: fetch one packet, persist it to our DB, then send the provider ACK. This demo simulates that with `POST /downlink_packet` — the caller plays the role of the provider pushing to us.
+
+**What queue sits between intake and decoders?**
+In production: SQS, Pub-Sub, or Kafka. The intake poller publishes `packet_id` after persisting. Decoder workers consume from the queue independently. This means a decoder crash loses no work — the message stays in the queue until a worker ACKs it.
+In this demo: FastAPI `BackgroundTasks` (in-process, in-memory). Crash-safe for the raw packet (persisted before ACK), but the processing job would be lost. Mitigated here by startup crash recovery (see below).
+
+**How many decoder workers, how do they scale?**
+The decoder is a pure stateless function: base64 decode → validate → write observation. In production, scale worker count independently of intake. Add workers when queue depth grows. In this demo there is one worker (the FastAPI background thread pool), sufficient for the demo throughput of 460–740 packets/sec.
+
+**What happens if a worker crashes mid-decode — is the packet safe?**
+Yes. The raw packet is committed to the DB *before* the ACK is returned. If the server crashes after persist but before decode finishes, the packet stays in `RECEIVED` status. On next startup, the app scans for all `RECEIVED` packets and reprocesses them — no packet is permanently lost.
+
+**What's the retry policy when processing fails?**
+In this demo: one attempt; on failure the packet is marked `DECODE_FAILED` with the error message stored for inspection.
+In production: exponential backoff with 3–5 retries, then move to a dead-letter queue. Dead-letter packets trigger an alert for manual inspection. Malformed packets (bad base64, missing fields) go straight to dead-letter — retrying them would always fail.
+
+**How do you ensure the 5-minute SLA at scale?**
+The system measures latency per observation (`customer_visible_time - downlink_time`) and records whether it earned revenue. To *guarantee* the SLA in production:
+1. Keep the processing backlog near zero by auto-scaling decoder workers when queue depth rises.
+2. Alert when p99 processing latency exceeds 4 minutes (one minute headroom).
+3. Prioritize packets whose downlink time is approaching the 5-minute window if the queue ever falls behind.
+
+
+
 This project demonstrates the important part of the assignment:
 
 ```text

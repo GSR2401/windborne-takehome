@@ -34,6 +34,20 @@ class Observation(BaseModel):
     data: dict[str, Any]
 
 
+class UplinkCommandRequest(BaseModel):
+    command_id: str = Field(..., examples=["cmd-B001-reboot-001"])
+    balloon_id: str = Field(..., examples=["B001"])
+    command_type: str = Field(..., examples=["reboot", "altitude_change", "ping"])
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+class UplinkCommandResponse(BaseModel):
+    command_id: str
+    balloon_id: str
+    queued: bool
+    message: str
+
+
 class PacketState(BaseModel):
     packet_id: str
     balloon_id: str

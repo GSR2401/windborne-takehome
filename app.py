@@ -2,10 +2,11 @@ from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 
-from models import DownlinkPacketRequest, DownlinkPacketResponse
+from models import DownlinkPacketRequest, DownlinkPacketResponse, UplinkCommandRequest, UplinkCommandResponse
 from pipeline import process_packet
 from storage import (
     get_packet,
+    get_packets_by_status,
     init_db,
     list_observations,
     list_packets,
@@ -23,6 +24,10 @@ app = FastAPI(
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    # Crash recovery: any packet still RECEIVED was persisted but never processed.
+    # Reprocess them now so no packet is permanently stuck.
+    for packet in get_packets_by_status("RECEIVED"):
+        process_packet(packet["packet_id"])
 
 
 @app.post("/downlink_packet", response_model=DownlinkPacketResponse, status_code=202)
@@ -81,6 +86,23 @@ def packets():
 @app.get("/metrics")
 def system_metrics():
     return metrics()
+
+
+@app.post("/uplink_command", response_model=UplinkCommandResponse, status_code=202)
+def uplink_command(payload: UplinkCommandRequest) -> UplinkCommandResponse:
+    """
+    Queue a command for uplink to a balloon.
+
+    In production: write to a durable uplink queue (SQS/Pub-Sub).
+    A worker picks it up and calls the satellite provider's uplink API.
+    Here we acknowledge receipt to demonstrate the interface.
+    """
+    return UplinkCommandResponse(
+        command_id=payload.command_id,
+        balloon_id=payload.balloon_id,
+        queued=True,
+        message="Command queued for uplink. In production a worker delivers this via the satellite provider API.",
+    )
 
 
 @app.get("/health")

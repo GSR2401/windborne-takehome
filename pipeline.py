@@ -1,5 +1,5 @@
 from decoder import decode_payload
-from storage import get_packet, mark_packet_failed, save_observation
+from storage import get_packet, mark_packet_failed, mark_packet_processed, save_observation
 
 
 def process_packet(packet_id: str) -> None:
@@ -10,9 +10,9 @@ def process_packet(packet_id: str) -> None:
 
     try:
         decoded = decode_payload(packet["raw_payload"])
-        # Some transmissions may produce zero observations. For demo purposes,
-        # include a simple opt-out flag in fake payloads.
+        # Some transmissions produce zero observations (e.g. status-only pings).
         if decoded.get("no_observation"):
+            mark_packet_processed(packet_id)
             return
         save_observation(
             packet_id=packet["packet_id"],

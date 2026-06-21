@@ -110,6 +110,15 @@ def list_packets() -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def mark_packet_processed(packet_id: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE packets SET status = ?, processed_at = ? WHERE packet_id = ?",
+            (PacketStatus.PROCESSED.value, utc_now_iso(), packet_id),
+        )
+        conn.commit()
+
+
 def mark_packet_failed(packet_id: str, error: str) -> None:
     with get_conn() as conn:
         conn.execute(
@@ -151,6 +160,14 @@ def save_observation(packet_id: str, balloon_id: str, downlink_time: str, data: 
             (PacketStatus.PROCESSED.value, visible_time, packet_id),
         )
         conn.commit()
+
+
+def get_packets_by_status(status: str) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM packets WHERE status = ? ORDER BY received_at ASC", (status,)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def list_observations(balloon_id: Optional[str] = None, limit: int = 100) -> list[dict[str, Any]]:
