@@ -3,6 +3,7 @@
 **Deployed URL:** https://web-production-f540e.up.railway.app
 **Swagger UI:** https://web-production-f540e.up.railway.app/docs
 **GitHub:** https://github.com/GSR2401/windborne-takehome
+**Design document:** [DESIGN.md](DESIGN.md) — assumptions, packet journey, concurrency model, tradeoffs
 
 ---
 
