@@ -1,6 +1,7 @@
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.responses import RedirectResponse
 
 from models import DownlinkPacketRequest, DownlinkPacketResponse, UplinkCommandRequest, UplinkCommandResponse
 from pipeline import process_packet
@@ -19,6 +20,11 @@ app = FastAPI(
     description="Downlink packet ingestion -> persistence-before-ACK -> decoding -> customer-visible observations.",
     version="1.0.0",
 )
+
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
 
 
 @app.on_event("startup")
