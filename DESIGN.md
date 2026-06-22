@@ -110,78 +110,70 @@ Packet C:          [persist]──[ACK]  [decode]──[save_obs]
 
 ## 4. Tradeoffs
 
-### Tradeoff 1: Persist before ACK (durability over speed)
+### Tradeoff 1: Persist before ACK
 
-| | Our choice | Alternative |
+| | Demo (our choice)           | Alternative              |
 |---|---|---|
-| What | ACK only after DB commit | ACK on receipt, persist async |
-| Speed | Slower — adds ~5ms per packet | Faster — ACK immediately |
-| Risk | Near-zero packet loss | Crash between ACK and persist = packet gone forever |
-| Why | Assignment says "must not lose any packet" | Unacceptable given hard requirement |
+| How     | ACK after DB commit         | ACK on receipt           |
+| Speed   | ~5ms slower per packet      | Immediate ACK            |
+| Risk    | Near-zero packet loss       | Crash = packet gone forever |
+| Why     | "Must not lose any packet"  | Unacceptable             |
 
-> **Rationale:** "We chose durability over speed. The 5ms write cost is acceptable at
-> 167 packets/sec. If the team prefers speed, ACK-on-receipt is valid — but requires accepting
-> a small loss window during crashes."
+> **Rationale:** 5ms write cost is acceptable at 167 packets/sec. ACK-on-receipt is valid
+> only if the team accepts a small loss window during crashes.
 
 ---
 
-### Tradeoff 2: Push model instead of polling
+### Tradeoff 2: Push model vs polling
 
-| | Our choice | Production |
+| | Demo (our choice)           | Production               |
 |---|---|---|
-| What | Provider pushes → `POST /downlink_packet` | We poll provider's dequeue API in a loop |
-| Demo | Simple, shows intake logic clearly | Requires satellite provider SDK/API |
-| Production | Provider may not support push | Correct model — we control drain rate |
-| Why | Sufficient to demonstrate the pipeline correctly | |
+| How      | Provider pushes to us      | We poll provider's API   |
+| Benefit  | Simple, no SDK needed      | We control drain rate    |
+| Drawback | Provider may not support push | Requires provider SDK |
 
-> **Rationale:** "Push model simulates intake correctly for the demo. In production
-> we'd poll their FIFO and run parallel pollers so drain rate exceeds 167 packets/second."
+> **Rationale:** Push model demonstrates the intake logic correctly. In production, parallel
+> pollers drain the queue faster than packets arrive (>167 packets/sec).
 
 ---
 
-### Tradeoff 3: In-memory queue instead of durable queue
+### Tradeoff 3: In-memory queue vs durable queue
 
-| | Our choice | Production |
+| | Demo (our choice)           | Production               |
 |---|---|---|
-| What | FastAPI `BackgroundTasks` | SQS / Pub-Sub / Kafka |
-| Durability | Job lost if server crashes after persist | Job survives crash — stays in queue |
-| Recovery | Startup scan reprocesses `RECEIVED` packets | Queue retries automatically |
-| Why | No infrastructure dependency, sufficient for demo | |
+| What       | FastAPI BackgroundTasks   | SQS / Pub-Sub / Kafka    |
+| Durability | Lost on server crash      | Survives crash           |
+| Recovery   | Startup reprocesses RECEIVED | Queue retries automatically |
 
-> **Rationale:** "BackgroundTasks is not durable. We mitigate this with startup crash
-> recovery — on boot we reprocess all RECEIVED packets. In production, a durable queue makes
-> this automatic and removes the need for the startup scan."
+> **Rationale:** No infrastructure dependency for the demo. Startup crash recovery closes
+> the gap. Production replaces this with a durable queue entirely.
 
 ---
 
-### Tradeoff 4: SQLite instead of Postgres
+### Tradeoff 4: SQLite vs Postgres
 
-| | Our choice | Production |
+| | Demo (our choice)           | Production               |
 |---|---|---|
-| What | SQLite + WAL mode | Postgres / CockroachDB |
-| Scale | Single file, single node | Replicated, horizontally scalable |
-| Throughput | ~460–740 packets/sec locally | Thousands/sec with connection pooling |
-| Why | Zero infrastructure, deploy anywhere, correct semantics | |
+| What       | SQLite + WAL mode         | Postgres / CockroachDB   |
+| Scale      | Single node               | Replicated, scalable     |
+| Throughput | ~460–740 packets/sec      | Thousands/sec            |
+| Why        | Zero infra, correct semantics | Swap the connection string |
 
-> **Rationale:** "SQLite with WAL mode gives correct transactional semantics and handles
-> the demo load easily. Schema and queries are identical in Postgres — swap the connection string."
+> **Rationale:** Schema and queries are identical in Postgres. SQLite handles demo load
+> easily and deploys anywhere with no infrastructure.
 
 ---
 
-### Tradeoff 5: FIFO throughput vs serial processing
+### Tradeoff 5: Serial vs parallel intake
 
-| | What happens |
+| | What happens                                          |
 |---|---|
-| Satellite provider | Fills FIFO at ~167 packets/sec asynchronously |
-| Our intake (demo) | FastAPI handles concurrent POSTs — effectively parallel |
-| Our intake (production polling) | Need multiple parallel pollers or we fall behind |
-| Risk if too slow | Queue backlog grows → observations arrive late → $0 revenue |
+| Provider side    | Fills FIFO at ~167 packets/sec             |
+| Demo intake      | FastAPI concurrent POSTs — parallel        |
+| Production poll  | Need parallel pollers or queue grows       |
+| Risk             | Backlog → late observations → $0 revenue  |
 
-The 5-minute SLA is fundamentally a **throughput problem**. If intake falls behind, every packet
-misses the SLA regardless of how fast decode is. One synchronous poller can process ~20–50
-packets/sec — not enough. Production fix: parallel pollers + auto-scale on queue depth.
-
-> **Rationale:** "The FIFO guarantees arrival order at the provider. We don't need to
-> process in that order — only guarantee no packet is dropped. Running parallel pollers lets
-> us drain faster than packets arrive while still persisting each one before ACK."
+> **Rationale:** FIFO guarantees arrival order at the provider — we don't need to process
+> in that order, only guarantee no packet is dropped. Parallel pollers drain faster than
+> packets arrive while still persisting each one before ACK.
 
