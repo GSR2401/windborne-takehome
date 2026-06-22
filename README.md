@@ -1,19 +1,41 @@
 # WindBorne Take-Home Demo
 
+**Deployed URL:** https://web-production-f540e.up.railway.app
+**Swagger UI:** https://web-production-f540e.up.railway.app/docs
+**GitHub:** https://github.com/GSR2401/windborne-takehome
+
+---
+
+## What I Chose to Build and Why
+
+The most important rule in the assignment is: **"we must not lose any packet a balloon has sent."**
+So I built the intake guarantee first — the server only ACKs after the raw packet is committed to
+the database in a transaction. Processing happens after persistence so intake stays fast under bursts.
+
+The full pipeline:
+```
+receive → persist (transaction) → ACK → decode (background) → observation → revenue
+```
+
+I also built startup crash recovery: on restart, any packet stuck in `RECEIVED` status is
+automatically reprocessed, closing the gap between an in-memory task queue and a durable one.
+
+---
+
 ## System Design
 
-### Scale assumptions
-- ~10,000 balloons aloft, each transmitting ~once per minute with ±5 min variation
-- Sustained load: ~167 packets/second, 24/7
-- Revenue rule: observation must reach customer within 5 minutes of downlink time
+### Scale
+- ~10,000 balloons aloft, each transmitting ~once per minute (±5 min variation)
+- Sustained load: **~167 packets/second, 24/7**
+- Revenue rule: observation must reach the customer within **5 minutes** of balloon downlink time
 
-### Production architecture
+### Production Architecture
 
-```text
+```
 Satellite provider FIFO queue
         |
         v
-  [Intake poller]  <-- polls provider API in a loop, one packet at a time
+  [Intake pollers]  <-- multiple parallel workers poll provider API
         |
         | persist raw packet (BEGIN / INSERT / COMMIT)
         v
@@ -30,174 +52,213 @@ Satellite provider FIFO queue
   Observations table  -->  Customer API
 ```
 
-### Answers to the key design questions
+### Key Design Questions
 
 **How do you receive from the satellite provider's FIFO queue?**
-The provider holds packets until we ACK them. In production a poller service calls the provider's dequeue API in a loop: fetch one packet, persist it to our DB, then send the provider ACK. This demo simulates that with `POST /downlink_packet` — the caller plays the role of the provider pushing to us.
+The provider holds packets until we ACK them. In production a poller calls the provider's dequeue
+API in a loop: fetch → persist → ACK. Multiple parallel pollers drain the queue faster than packets
+arrive. This demo simulates intake with `POST /downlink_packet` — the caller plays the provider role.
 
 **What queue sits between intake and decoders?**
-In production: SQS, Pub-Sub, or Kafka. The intake poller publishes `packet_id` after persisting. Decoder workers consume from the queue independently. This means a decoder crash loses no work — the message stays in the queue until a worker ACKs it.
-In this demo: FastAPI `BackgroundTasks` (in-process, in-memory). Crash-safe for the raw packet (persisted before ACK), but the processing job would be lost. Mitigated here by startup crash recovery (see below).
+Production: SQS/Pub-Sub/Kafka. Intake publishes `packet_id` after persisting. Decoder workers
+consume independently — a crash loses no work because the message stays in the queue.
+Demo: FastAPI `BackgroundTasks` (in-memory). Mitigated by startup crash recovery.
 
 **How many decoder workers, how do they scale?**
-The decoder is a pure stateless function: base64 decode → validate → write observation. In production, scale worker count independently of intake. Add workers when queue depth grows. In this demo there is one worker (the FastAPI background thread pool), sufficient for the demo throughput of 460–740 packets/sec.
+The decoder is a pure stateless function (base64 → validate → write). Scale worker count
+independently of intake. Auto-scale when queue depth rises. Demo: one background thread pool,
+sufficient for 460–740 packets/sec locally.
 
 **What happens if a worker crashes mid-decode — is the packet safe?**
-Yes. The raw packet is committed to the DB *before* the ACK is returned. If the server crashes after persist but before decode finishes, the packet stays in `RECEIVED` status. On next startup, the app scans for all `RECEIVED` packets and reprocesses them — no packet is permanently lost.
+The raw packet is committed to DB before ACK, so it is always safe. If the server crashes before
+decode completes, the packet stays in `RECEIVED` status. On next startup, the app automatically
+reprocesses all `RECEIVED` packets.
 
 **What's the retry policy when processing fails?**
-In this demo: one attempt; on failure the packet is marked `DECODE_FAILED` with the error message stored for inspection.
-In production: exponential backoff with 3–5 retries, then move to a dead-letter queue. Dead-letter packets trigger an alert for manual inspection. Malformed packets (bad base64, missing fields) go straight to dead-letter — retrying them would always fail.
+Demo: one attempt; failure marks packet `DECODE_FAILED` with error stored for inspection.
+Production: exponential backoff (3–5 retries), then dead-letter queue with alerting. Malformed
+packets (bad base64, missing fields) go straight to dead-letter — retrying them always fails.
 
 **How do you ensure the 5-minute SLA at scale?**
-The system measures latency per observation (`customer_visible_time - downlink_time`) and records whether it earned revenue. To *guarantee* the SLA in production:
-1. Keep the processing backlog near zero by auto-scaling decoder workers when queue depth rises.
+The 5-minute SLA is a throughput problem — if intake falls behind, every packet misses it.
+1. Keep backlog near zero by auto-scaling workers when queue depth grows.
 2. Alert when p99 processing latency exceeds 4 minutes (one minute headroom).
-3. Prioritize packets whose downlink time is approaching the 5-minute window if the queue ever falls behind.
+3. Prioritize packets whose downlink time is approaching the 5-minute window if queue falls behind.
 
+### Assumptions
+- One flat FIFO queue per WindBorne account (not per balloon or region)
+- Provider retries until ACK — packet stays in queue if we don't ACK
+- `packet_id` is globally unique, assigned by the provider
+- Wire format is base64-encoded JSON (real format likely binary/protobuf)
+- One packet → zero or one observation (not multiple)
+- 5-minute window measured from balloon's downlink time, not satellite receipt time
+- Processing order across different balloons does not matter
 
+### Tradeoffs
 
-This project demonstrates the important part of the assignment:
+| Decision | Choice | Tradeoff |
+|---|---|---|
+| ACK timing | Persist first, then ACK | ~5ms slower per packet but zero packet loss |
+| Intake model | Push (POST endpoint) | Simpler demo; production would poll provider API |
+| Task queue | FastAPI BackgroundTasks | No infra dependency; not durable across crashes |
+| Crash recovery | Startup reprocess of RECEIVED | Closes durability gap without a real queue |
+| Storage | SQLite + WAL | Zero infra, correct semantics; not horizontally scalable |
 
-```text
-Downlinked balloon packet
-  -> persist raw packet before ACK
-  -> decode payload
-  -> create customer-visible observation
-  -> calculate whether it earned $1 within the 5-minute SLA
+---
+
+## Demo Architecture
+
 ```
-
-## Why this architecture?
-
-The assignment says packets stay in the satellite provider's FIFO buffer until we acknowledge receipt, and that we must not lose balloon packets. So this demo follows the most important rule:
-
-> ACK only after the raw packet is persisted.
-
-Processing happens after persistence so intake can remain fast during bursts.
-
-## Architecture
-
-```text
 POST /downlink_packet
         |
         v
-SQLite packets table  <- raw packet persisted here first
+SQLite packets table  <-- raw packet persisted in transaction
         |
         v
-ACK 202 Accepted
+ACK 202 returned to caller
         |
         v
-Background processing
+Background: decode base64(JSON) → validate fields
         |
-        v
-Decode base64(JSON)
-        |
-        v
-SQLite observations table
-        |
-        v
-GET /observations customer API
+        ├── no_observation flag → mark PROCESSED, stop
+        ├── decode error → mark DECODE_FAILED, store error
+        └── success → SQLite observations table
+                              |
+                              v
+                    GET /observations  (customer API)
 ```
 
-Production version would replace single-node SQLite with replicated durable storage and a durable queue such as Kafka/SQS.
+---
 
-## Files
+## Endpoints
 
-```text
-app.py              FastAPI routes
-models.py           Request/response models
-storage.py          SQLite persistence and metrics
-decoder.py          Base64 JSON decoder
-pipeline.py         Packet -> observation processing
-fake_packets.py     Fake encoded packet generator
-tests/              Pytest test cases
-requirements.txt    Python dependencies
+```
+POST /downlink_packet           Submit/simulate encoded balloon packet
+POST /uplink_command            Queue a command for uplink to a balloon
+GET  /observations              Customer-visible observations + revenue
+GET  /packets/{packet_id}       Inspect a packet's full lifecycle state
+GET  /packets                   List all packets
+GET  /metrics                   System metrics and revenue totals
+GET  /health                    Health check
 ```
 
-## Setup
+---
 
+## Example Requests
+
+**Submit a packet:**
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-## Run locally
-
-```bash
-uvicorn app:app --reload
-```
-
-Open:
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-## Generate fake packet
-
-```bash
-python fake_packets.py
-```
-
-Example packet shape:
-
-```json
-{
-  "packet_id": "pkt-B-00001-1781971200",
-  "balloon_id": "B-00001",
-  "downlink_time": "2026-06-20T12:00:00+00:00",
-  "encoded_payload": "eyJsYXQiOj..."
-}
-```
-
-## Example request
-
-```bash
-curl -X POST http://127.0.0.1:8000/downlink_packet \
+curl -X POST https://web-production-f540e.up.railway.app/downlink_packet \
   -H "Content-Type: application/json" \
   -d '{
-    "packet_id": "pkt-B001-demo",
+    "packet_id": "pkt-B001-demo-001",
     "balloon_id": "B001",
-    "downlink_time": "2026-06-20T12:00:00+00:00",
+    "downlink_time": "2026-06-21T10:00:00+00:00",
     "encoded_payload": "eyJsYXQiOjM3Ljc3NDksImxvbiI6LTEyMi40MTk0LCJhbHRpdHVkZV9tIjoxODIwMCwidGVtcGVyYXR1cmVfYyI6LTQ4LjUsInByZXNzdXJlX2hwYSI6NzIuMSwiaHVtaWRpdHkiOjAuMTJ9"
   }'
 ```
 
-## Useful endpoints
-
-```text
-POST /downlink_packet       Submit/simulate encoded balloon packet
-GET  /observations          Customer-visible observations
-GET  /packets/{packet_id}   Inspect packet lifecycle state
-GET  /packets               List packets
-GET  /metrics               Revenue and system metrics
-GET  /health                Health check
+**View customer observations:**
+```bash
+curl https://web-production-f540e.up.railway.app/observations
 ```
 
-## Run tests
+**Inspect packet lifecycle:**
+```bash
+curl https://web-production-f540e.up.railway.app/packets/pkt-B001-demo-001
+```
+
+**System metrics:**
+```bash
+curl https://web-production-f540e.up.railway.app/metrics
+```
+
+**Send an uplink command:**
+```bash
+curl -X POST https://web-production-f540e.up.railway.app/uplink_command \
+  -H "Content-Type: application/json" \
+  -d '{
+    "command_id": "cmd-B001-ping-001",
+    "balloon_id": "B001",
+    "command_type": "ping",
+    "parameters": {}
+  }'
+```
+
+---
+
+## Running Locally
 
 ```bash
-pytest
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3.11 -m uvicorn app:app --reload
 ```
 
-Tests cover:
+Open: http://127.0.0.1:8000/docs
 
-- valid packet persists, ACKs, and creates observation
-- duplicate packet submission is idempotent
-- invalid packet is stored but marked `DECODE_FAILED`
-- late observation earns `$0`
-- burst of 100 packets is accepted and persisted
+**Generate a fake encoded packet:**
+```bash
+python3.11 fake_packets.py
+```
 
-## What I would change before production
+**Run burst demo (shows before/after metrics):**
+```bash
+python3.11 burst_demo.py 100     # 100 packets
+python3.11 burst_demo.py 1000    # 1000 packets
+```
 
-- Replace SQLite with replicated durable storage such as managed Postgres/CockroachDB.
-- Add a durable queue between intake and processing, such as Kafka/SQS/PubSub.
-- Horizontally scale decoder workers.
-- Add retry policies and a dead-letter queue.
-- Add authentication, rate limits, observability, dashboards, and alerting.
-- Use provider-specific ACK APIs instead of HTTP response ACK simulation.
+---
 
-## AI usage note
+## Tests
 
-AI was used to help structure the architecture, generate boilerplate FastAPI code, and outline reliability-focused tests. Final design choices are based on the assignment requirements: persistence before acknowledgement, traceability, and customer-visible observation latency.
+```bash
+python3.11 -m pytest -v tests/test_pipeline.py
+```
+
+| Test | What it proves |
+|---|---|
+| `test_valid_packet_is_persisted_acked_and_observed` | Full happy path end to end |
+| `test_duplicate_packet_is_idempotent` | Provider retry safety — same packet twice = one row |
+| `test_invalid_packet_is_stored_but_marked_failed` | Bad data is stored and traceable, not dropped |
+| `test_revenue_is_zero_after_five_minutes` | SLA revenue rule enforced correctly |
+| `test_no_observation_packet_is_processed_but_skipped` | Zero-observation transmissions handled |
+| `test_burst_of_packets_all_persisted` | 100 packets under burst all persist and are observed |
+
+---
+
+## Files
+
+```
+app.py              FastAPI routes and startup crash recovery
+models.py           Request/response models including uplink
+storage.py          SQLite persistence, metrics, status helpers
+decoder.py          Base64 JSON decoder with field validation
+pipeline.py         Packet → observation processing logic
+fake_packets.py     Fake encoded packet generator for testing
+burst_demo.py       Burst load demo with before/after metrics
+tests/              Pytest test suite
+requirements.txt    Python dependencies
+Procfile            Railway deployment start command
+```
+
+---
+
+## What I Would Change Before Production
+
+1. **Replace SQLite with Postgres/CockroachDB** — replicated, horizontally scalable
+2. **Replace BackgroundTasks with a durable queue** (SQS/Pub-Sub) — processing jobs survive crashes automatically
+3. **Replace push endpoint with a poller** — poll satellite provider's FIFO API with parallel workers to drain at >167 packets/sec
+4. **Add retry with exponential backoff** — currently DECODE_FAILED is terminal; production needs retries + dead-letter queue
+5. **Add observability** — latency histograms, queue depth alerts, SLA breach alerting when p99 approaches 4 minutes
+6. **Add authentication and rate limiting** on all endpoints
+7. **Scale decoder workers independently** of intake — decoders are stateless and trivially parallelizable
+
+---
+
+## AI Usage
+
+Claude Code was used throughout: to structure the architecture, generate FastAPI boilerplate,
+write tests, debug WAL mode behavior, and reason through design tradeoffs. All design decisions —
+what to build, what to skip, and the tradeoffs taken — were made based on the assignment requirements.
