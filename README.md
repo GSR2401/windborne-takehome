@@ -260,6 +260,4 @@ The 5-minute SLA is a throughput problem — if intake falls behind, every packe
 
 ## AI Usage
 
-Claude Code was used throughout: to structure the architecture, generate FastAPI boilerplate,
-write tests, debug WAL mode behavior, and reason through design tradeoffs. All design decisions —
-what to build, what to skip, and the tradeoffs taken — were made based on the assignment requirements.
+ChatGPT and Claude Code were used to assist with architectural brainstorming, boilerplate generation, and documentation.
