@@ -22,90 +22,6 @@ automatically reprocessed, closing the gap between an in-memory task queue and a
 
 ---
 
-## System Design
-
-### Scale
-- ~10,000 balloons aloft, each transmitting ~once per minute (±5 min variation)
-- Sustained load: **~167 packets/second, 24/7**
-- Revenue rule: observation must reach the customer within **5 minutes** of balloon downlink time
-
-### Production Architecture
-
-```
-Satellite provider FIFO queue
-        |
-        v
-  [Intake pollers]  <-- multiple parallel workers poll provider API
-        |
-        | persist raw packet (BEGIN / INSERT / COMMIT)
-        v
-  Durable DB (Postgres / CockroachDB)
-        |
-        | publish packet_id
-        v
-  Durable queue (SQS / Pub-Sub / Kafka)
-        |
-        v
-  [Decoder workers]  <-- stateless, horizontally scalable
-        |
-        v
-  Observations table  -->  Customer API
-```
-
-### Key Design Questions
-
-**How do you receive from the satellite provider's FIFO queue?**
-The provider holds packets until we ACK them. In production a poller calls the provider's dequeue
-API in a loop: fetch → persist → ACK. Multiple parallel pollers drain the queue faster than packets
-arrive. This demo simulates intake with `POST /downlink_packet` — the caller plays the provider role.
-
-**What queue sits between intake and decoders?**
-Production: SQS/Pub-Sub/Kafka. Intake publishes `packet_id` after persisting. Decoder workers
-consume independently — a crash loses no work because the message stays in the queue.
-Demo: FastAPI `BackgroundTasks` (in-memory). Mitigated by startup crash recovery.
-
-**How many decoder workers, how do they scale?**
-The decoder is a pure stateless function (base64 → validate → write). Scale worker count
-independently of intake. Auto-scale when queue depth rises. Demo: one background thread pool,
-sufficient for 460–740 packets/sec locally.
-
-**What happens if a worker crashes mid-decode — is the packet safe?**
-The raw packet is committed to DB before ACK, so it is always safe. If the server crashes before
-decode completes, the packet stays in `RECEIVED` status. On next startup, the app automatically
-reprocesses all `RECEIVED` packets.
-
-**What's the retry policy when processing fails?**
-Demo: one attempt; failure marks packet `DECODE_FAILED` with error stored for inspection.
-Production: exponential backoff (3–5 retries), then dead-letter queue with alerting. Malformed
-packets (bad base64, missing fields) go straight to dead-letter — retrying them always fails.
-
-**How do you ensure the 5-minute SLA at scale?**
-The 5-minute SLA is a throughput problem — if intake falls behind, every packet misses it.
-1. Keep backlog near zero by auto-scaling workers when queue depth grows.
-2. Alert when p99 processing latency exceeds 4 minutes (one minute headroom).
-3. Prioritize packets whose downlink time is approaching the 5-minute window if queue falls behind.
-
-### Assumptions
-- One flat FIFO queue per WindBorne account (not per balloon or region)
-- Provider retries until ACK — packet stays in queue if we don't ACK
-- `packet_id` is globally unique, assigned by the provider
-- Wire format is base64-encoded JSON (real format likely binary/protobuf)
-- One packet → zero or one observation (not multiple)
-- 5-minute window measured from balloon's downlink time, not satellite receipt time
-- Processing order across different balloons does not matter
-
-### Tradeoffs
-
-| Decision | Choice | Tradeoff |
-|---|---|---|
-| ACK timing | Persist first, then ACK | ~5ms slower per packet but zero packet loss |
-| Intake model | Push (POST endpoint) | Simpler demo; production would poll provider API |
-| Task queue | FastAPI BackgroundTasks | No infra dependency; not durable across crashes |
-| Crash recovery | Startup reprocess of RECEIVED | Closes durability gap without a real queue |
-| Storage | SQLite + WAL | Zero infra, correct semantics; not horizontally scalable |
-
----
-
 ## Demo Architecture
 
 ```
@@ -121,11 +37,11 @@ ACK 202 returned to caller
 Background: decode base64(JSON) → validate fields
         |
         ├── no_observation flag → mark PROCESSED, stop
-        ├── decode error → mark DECODE_FAILED, store error
-        └── success → SQLite observations table
-                              |
-                              v
-                    GET /observations  (customer API)
+        ├── decode error       → mark DECODE_FAILED, store error
+        └── success            → SQLite observations table
+                                          |
+                                          v
+                                GET /observations  (customer API)
 ```
 
 ---
@@ -242,6 +158,90 @@ tests/              Pytest test suite
 requirements.txt    Python dependencies
 Procfile            Railway deployment start command
 ```
+
+---
+
+## System Design (Production)
+
+### Scale
+- ~10,000 balloons aloft, each transmitting ~once per minute (±5 min variation)
+- Sustained load: **~167 packets/second, 24/7**
+- Revenue rule: observation must reach the customer within **5 minutes** of balloon downlink time
+
+### Production Architecture
+
+```
+Satellite provider FIFO queue
+        |
+        v
+  [Intake pollers]  <-- multiple parallel workers poll provider API
+        |
+        | persist raw packet (BEGIN / INSERT / COMMIT)
+        v
+  Durable DB (Postgres / CockroachDB)
+        |
+        | publish packet_id
+        v
+  Durable queue (SQS / Pub-Sub / Kafka)
+        |
+        v
+  [Decoder workers]  <-- stateless, horizontally scalable
+        |
+        v
+  Observations table  -->  Customer API
+```
+
+### Key Design Questions
+
+**How do you receive from the satellite provider's FIFO queue?**
+The provider holds packets until we ACK them. In production a poller calls the provider's dequeue
+API in a loop: fetch → persist → ACK. Multiple parallel pollers drain the queue faster than packets
+arrive. This demo simulates intake with `POST /downlink_packet` — the caller plays the provider role.
+
+**What queue sits between intake and decoders?**
+Production: SQS/Pub-Sub/Kafka. Intake publishes `packet_id` after persisting. Decoder workers
+consume independently — a crash loses no work because the message stays in the queue.
+Demo: FastAPI `BackgroundTasks` (in-memory). Mitigated by startup crash recovery.
+
+**How many decoder workers, how do they scale?**
+The decoder is a pure stateless function (base64 → validate → write). Scale worker count
+independently of intake. Auto-scale when queue depth rises. Demo: one background thread pool,
+sufficient for 460–740 packets/sec locally.
+
+**What happens if a worker crashes mid-decode — is the packet safe?**
+The raw packet is committed to DB before ACK, so it is always safe. If the server crashes before
+decode completes, the packet stays in `RECEIVED` status. On next startup, the app automatically
+reprocesses all `RECEIVED` packets.
+
+**What's the retry policy when processing fails?**
+Demo: one attempt; failure marks packet `DECODE_FAILED` with error stored for inspection.
+Production: exponential backoff (3–5 retries), then dead-letter queue with alerting. Malformed
+packets (bad base64, missing fields) go straight to dead-letter — retrying them always fails.
+
+**How do you ensure the 5-minute SLA at scale?**
+The 5-minute SLA is a throughput problem — if intake falls behind, every packet misses it.
+1. Keep backlog near zero by auto-scaling workers when queue depth grows.
+2. Alert when p99 processing latency exceeds 4 minutes (one minute headroom).
+3. Prioritize packets whose downlink time is approaching the 5-minute window if queue falls behind.
+
+### Assumptions
+- One flat FIFO queue per WindBorne account (not per balloon or region)
+- Provider retries until ACK — packet stays in queue if we don't ACK
+- `packet_id` is globally unique, assigned by the provider
+- Wire format is base64-encoded JSON (real format likely binary/protobuf)
+- One packet → zero or one observation (not multiple)
+- 5-minute window measured from balloon's downlink time, not satellite receipt time
+- Processing order across different balloons does not matter
+
+### Tradeoffs
+
+| Decision | Choice | Tradeoff |
+|---|---|---|
+| ACK timing | Persist first, then ACK | ~5ms slower per packet but zero packet loss |
+| Intake model | Push (POST endpoint) | Simpler demo; production would poll provider API |
+| Task queue | FastAPI BackgroundTasks | No infra dependency; not durable across crashes |
+| Crash recovery | Startup reprocess of RECEIVED | Closes durability gap without a real queue |
+| Storage | SQLite + WAL | Zero infra, correct semantics; not horizontally scalable |
 
 ---
 
